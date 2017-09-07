@@ -3,6 +3,7 @@ package cluster
 import (
 	"strings"
 
+	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 )
 
@@ -93,7 +94,8 @@ func (images Images) Filter(opts ImageFilterOptions) Images {
 		// TODO: this is wrong if RepoTags == []
 		return opts.All ||
 			(len(image.RepoTags) != 0 && image.RepoTags[0] != "<none>:<none>") ||
-			(len(image.RepoDigests) != 0 && image.RepoDigests[0] != "<none>@<none>")
+			(len(image.RepoDigests) != 0 && image.RepoDigests[0] != "<none>@<none>") ||
+			opts.Filters.Include("dangling") // delegate dangling filter to decide
 	}
 
 	includeFilter := func(image *Image) bool {
@@ -107,28 +109,55 @@ func (images Images) Filter(opts ImageFilterOptions) Images {
 		if !opts.Filters.Include(filter) {
 			return true
 		}
+		candidates := map[string]struct{}{}
 		for _, repoTag := range image.RepoTags {
 			imageName, _ := ParseRepositoryTag(repoTag)
-			for _, pattern := range opts.Filters.Get(filter) {
-				if repoTag == pattern || pattern == imageName {
-					return true
-				}
-			}
+			candidates[repoTag] = struct{}{}
+			candidates[imageName] = struct{}{}
 		}
 		for _, repoDigests := range image.RepoDigests {
 			imageName, _ := ParseRepositoryTag(repoDigests)
+			candidates[repoDigests] = struct{}{}
+			candidates[imageName] = struct{}{}
+		}
+		for candidate := range candidates {
 			for _, pattern := range opts.Filters.Get(filter) {
-				if repoDigests == pattern || pattern == imageName {
+				ref, err := reference.Parse(candidate)
+				if err != nil {
+					continue
+				}
+				found, matchErr := reference.FamiliarMatch(pattern, ref)
+				if matchErr == nil && found {
 					return true
 				}
 			}
 		}
+
 		return false
+	}
+
+	danglingFilter := func(image *Image) bool {
+		if opts.Filters.Include("dangling") {
+			if len(image.RepoTags) == 0 {
+				image.RepoTags = []string{"<none>:<none>"}
+			}
+
+			if opts.Filters.ExactMatch("dangling", "true") && image.RepoTags[0] != "<none>:<none>" {
+				// for dangling true, filter out non-dangling images
+				return false
+			}
+
+			if opts.Filters.ExactMatch("dangling", "false") && image.RepoTags[0] == "<none>:<none>" {
+				// for dangling false, filter out dangling images
+				return false
+			}
+		}
+		return true
 	}
 
 	filtered := make([]*Image, 0, len(images))
 	for _, image := range images {
-		if includeAll(image) && includeFilter(image) && referenceFilter(image, "reference") {
+		if includeAll(image) && includeFilter(image) && referenceFilter(image, "reference") && danglingFilter(image) {
 			filtered = append(filtered, image)
 		}
 	}

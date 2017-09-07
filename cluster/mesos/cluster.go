@@ -25,15 +25,15 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/mesos/mesos-go/mesosproto"
 	mesosscheduler "github.com/mesos/mesos-go/scheduler"
-	"github.com/samalba/dockerclient"
 )
 
 // Cluster struct for mesos
 type Cluster struct {
 	sync.RWMutex
 
+	cluster.ClusterEventHandlers
+
 	dockerEnginePort    string
-	eventHandlers       *cluster.EventHandlers
 	master              string
 	agents              map[string]*agent
 	scheduler           *Scheduler
@@ -70,16 +70,16 @@ func NewCluster(scheduler *scheduler.Scheduler, TLSConfig *tls.Config, master st
 		flag.Lookup("logtostderr").Value.Set("true")
 	}
 	cluster := &Cluster{
-		dockerEnginePort:    defaultDockerEnginePort,
-		eventHandlers:       cluster.NewEventHandlers(),
-		master:              master,
-		agents:              make(map[string]*agent),
-		TLSConfig:           TLSConfig,
-		options:             &options,
-		offerTimeout:        defaultOfferTimeout,
-		taskCreationTimeout: defaultTaskCreationTimeout,
-		engineOpts:          engineOptions,
-		refuseTimeout:       defaultRefuseTimeout,
+		ClusterEventHandlers: cluster.NewClusterEventHandlers(),
+		dockerEnginePort:     defaultDockerEnginePort,
+		master:               master,
+		agents:               make(map[string]*agent),
+		TLSConfig:            TLSConfig,
+		options:              &options,
+		offerTimeout:         defaultOfferTimeout,
+		taskCreationTimeout:  defaultTaskCreationTimeout,
+		engineOpts:           engineOptions,
+		refuseTimeout:        defaultRefuseTimeout,
 	}
 
 	cluster.pendingTasks = task.NewTasks(cluster)
@@ -166,27 +166,16 @@ func NewCluster(scheduler *scheduler.Scheduler, TLSConfig *tls.Config, master st
 	return cluster, nil
 }
 
-// Handle callbacks for the events
-func (c *Cluster) Handle(e *cluster.Event) error {
-	c.eventHandlers.Handle(e)
-	return nil
-}
-
-// RegisterEventHandler registers an event handler.
-func (c *Cluster) RegisterEventHandler(h cluster.EventHandler) error {
-	return c.eventHandlers.RegisterEventHandler(h)
-}
-
-// UnregisterEventHandler unregisters a previously registered event handler.
-func (c *Cluster) UnregisterEventHandler(h cluster.EventHandler) {
-	c.eventHandlers.UnregisterEventHandler(h)
+// NewAPIEventHandler creates a new API events handler
+func (c *Cluster) NewAPIEventHandler() *cluster.APIEventHandler {
+	return cluster.NewAPIEventHandler()
 }
 
 // StartContainer starts a container
-func (c *Cluster) StartContainer(container *cluster.Container, hostConfig *dockerclient.HostConfig) error {
+func (c *Cluster) StartContainer(container *cluster.Container) error {
 	// if the container was started less than a second ago in detach mode, do not start it
 	if time.Now().Unix()-container.Created > 1 || container.Config.Labels[cluster.SwarmLabelNamespace+".mesos.detach"] != "true" {
-		return container.Engine.StartContainer(container, hostConfig)
+		return container.Engine.StartContainer(container)
 	}
 	return nil
 }
@@ -256,7 +245,7 @@ func (c *Cluster) Image(IDOrName string) *cluster.Image {
 }
 
 // RemoveImages removes images from the cluster
-func (c *Cluster) RemoveImages(name string, force bool) ([]types.ImageDelete, error) {
+func (c *Cluster) RemoveImages(name string, force bool) ([]types.ImageDeleteResponseItem, error) {
 	return nil, errNotSupported
 }
 
@@ -362,22 +351,22 @@ func (c *Cluster) Container(IDOrName string) *cluster.Container {
 }
 
 // RemoveImage removes an image from the cluster
-func (c *Cluster) RemoveImage(image *cluster.Image) ([]types.ImageDelete, error) {
+func (c *Cluster) RemoveImage(image *cluster.Image) ([]types.ImageDeleteResponseItem, error) {
 	return nil, errNotSupported
 }
 
 // Pull pulls images on the cluster nodes
-func (c *Cluster) Pull(name string, authConfig *types.AuthConfig, callback func(where, status string, err error)) {
+func (c *Cluster) Pull(name string, authConfig *types.AuthConfig, callback func(msg cluster.JSONMessageWrapper)) {
 
 }
 
 // Load images
-func (c *Cluster) Load(imageReader io.Reader, callback func(where, status string, err error)) {
+func (c *Cluster) Load(imageReader io.Reader, callback func(msg cluster.JSONMessageWrapper)) {
 
 }
 
 // Import image
-func (c *Cluster) Import(source string, ref string, tag string, imageReader io.Reader, callback func(what, status string, err error)) {
+func (c *Cluster) Import(source string, ref string, tag string, imageReader io.Reader, callback func(msg cluster.JSONMessageWrapper)) {
 
 }
 
@@ -649,7 +638,7 @@ func (c *Cluster) RANDOMENGINE() (*cluster.Engine, error) {
 }
 
 // BuildImage builds an image
-func (c *Cluster) BuildImage(buildContext io.Reader, buildImage *types.ImageBuildOptions, out io.Writer) error {
+func (c *Cluster) BuildImage(buildContext io.Reader, buildImage *types.ImageBuildOptions, callback func(msg cluster.JSONMessageWrapper)) error {
 	c.scheduler.Lock()
 
 	// get an engine
@@ -667,17 +656,33 @@ func (c *Cluster) BuildImage(buildContext io.Reader, buildImage *types.ImageBuil
 		return err
 	}
 	n := nodes[0]
+	engine := c.agents[n.ID].engine
 
-	reader, err := c.agents[n.ID].engine.BuildImage(buildContext, buildImage)
-	if err != nil {
-		return err
+	var engineCallback func(msg cluster.JSONMessage)
+	if callback != nil {
+		engineCallback = func(msg cluster.JSONMessage) {
+			callback(cluster.JSONMessageWrapper{
+				EngineName: engine.Name,
+				Msg:        msg,
+			})
+		}
+	}
+	err = engine.BuildImage(buildContext, buildImage, engineCallback)
+	if callback != nil {
+		if err != nil {
+			callback(cluster.JSONMessageWrapper{
+				EngineName: engine.Name,
+				Err:        err,
+			})
+		} else {
+			callback(cluster.JSONMessageWrapper{
+				EngineName: engine.Name,
+				Success:    true,
+			})
+		}
 	}
 
-	if _, err := io.Copy(out, reader); err != nil {
-		return err
-	}
-
-	c.agents[n.ID].engine.RefreshImages()
+	engine.RefreshImages()
 	return nil
 }
 

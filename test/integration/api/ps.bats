@@ -141,10 +141,6 @@ function teardown() {
 }
 
 @test "docker ps --filter volume" {
-	run docker --version
-	if [[ "${output}" == "Docker version 1.9"* || "${output}" == "Docker version 1.10"* ]]; then
-		skip
-	fi
 	start_docker_with_busybox 2
 	swarm_manage
 
@@ -157,4 +153,82 @@ function teardown() {
 	[[ "${output}" == *"node-0/c1"* ]]
 	[[ "${output}" == *"node-1/c2"* ]]
 	[[ "${output}" != *"node-1/c3"* ]]
+}
+
+@test "docker ps --filter network" {
+	start_docker_with_busybox 2
+	swarm_manage
+
+	run docker_swarm network ls
+	[ "${#lines[@]}" -eq 7 ]
+
+	docker_swarm network create -d bridge node-0/test1
+	docker_swarm network create -d bridge node-1/test1
+	docker_swarm network create -d bridge node-1/test2
+
+	run docker_swarm network ls
+	[ "${#lines[@]}" -eq 10 ]
+
+	docker_swarm run --name c1 -e constraint:node==node-0 --net node-0/test1 -d busybox:latest sleep 100
+	docker_swarm run --name c2 -e constraint:node==node-1 --net node-1/test1 -d busybox:latest sleep 100
+	docker_swarm run --name c3 -e constraint:node==node-1 --net node-1/test2 -d busybox:latest sleep 100
+
+	run docker_swarm ps --filter network=test1
+	[ "$status" -eq 0 ]
+	[[ "${output}" == *"node-0/c1"* ]]
+	[[ "${output}" == *"node-1/c2"* ]]
+	[[ "${output}" != *"node-1/c3"* ]]
+}
+
+@test "docker ps --filter is-task" {
+	start_docker_with_busybox 2
+	swarm_manage
+
+	docker_swarm run --name c1 -e constraint:node==node-0 --label com.docker.swarm.task='' -d busybox:latest sleep 100
+	docker_swarm run --name c2 -e constraint:node==node-1 -d busybox:latest sleep 100
+
+	run docker_swarm ps --filter is-task=true
+	[ "$status" -eq 0 ]
+	[[ "${output}" == *"node-0/c1"* ]]
+	[[ "${output}" != *"node-1/c2"* ]]
+
+	run docker_swarm ps --filter is-task=false
+	[ "$status" -eq 0 ]
+	[[ "${output}" != *"node-0/c1"* ]]
+	[[ "${output}" == *"node-1/c2"* ]]
+}
+
+@test "docker ps --filter health" {
+	start_docker_with_busybox 2
+	swarm_manage
+
+	docker_swarm run --name c1 -e constraint:node==node-0 --health-cmd true -d busybox:latest sleep 100
+	docker_swarm run --name c2 -e constraint:node==node-1 --health-cmd false -d busybox:latest sleep 100
+	docker_swarm run --name c3 -e constraint:node==node-1 -d busybox:latest sleep 100
+
+	run docker_swarm ps --filter health=starting
+	[ "$status" -eq 0 ]
+	[[ "${output}" == *"node-0/c1"* ]]
+	[[ "${output}" == *"node-1/c2"* ]]
+	[[ "${output}" != *"node-1/c3"* ]]
+
+	retry 120 5 eval "docker_swarm ps | grep -q 'unhealthy'"
+
+	run docker_swarm ps --filter health=healthy
+	[ "$status" -eq 0 ]
+	[[ "${output}" == *"node-0/c1"* ]]
+	[[ "${output}" != *"node-1/c2"* ]]
+	[[ "${output}" != *"node-1/c3"* ]]
+
+	run docker_swarm ps --filter health=unhealthy
+	[ "$status" -eq 0 ]
+	[[ "${output}" != *"node-0/c1"* ]]
+	[[ "${output}" == *"node-1/c2"* ]]
+	[[ "${output}" != *"node-1/c3"* ]]
+
+	run docker_swarm ps --filter health=none
+	[ "$status" -eq 0 ]
+	[[ "${output}" != *"node-0/c1"* ]]
+	[[ "${output}" != *"node-1/c2"* ]]
+	[[ "${output}" == *"node-1/c3"* ]]
 }

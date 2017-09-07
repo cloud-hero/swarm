@@ -26,11 +26,12 @@ import (
 	"github.com/docker/swarm/experimental"
 	"github.com/docker/swarm/version"
 	"github.com/gorilla/mux"
-	"github.com/samalba/dockerclient"
 )
 
-// APIVERSION is the API version supported by swarm manager
-const APIVERSION = "1.22"
+const (
+	// APIVERSION is the default API version supported by swarm manager
+	APIVERSION = "1.30"
+)
 
 var (
 	ShouldRefreshOnNodeFilter  = false
@@ -63,21 +64,7 @@ func getInfo(c *context, w http.ResponseWriter, r *http.Request) {
 		NoProxy:           os.Getenv("no_proxy"),
 		SystemTime:        time.Now().Format(time.RFC3339Nano),
 		ExperimentalBuild: experimental.ENABLED,
-	}
-
-	// API versions older than 1.22 use DriverStatus and return \b characters in the output
-	status := c.statusHandler.Status()
-	if c.apiVersion != "" && typesversions.LessThan(c.apiVersion, "1.22") {
-		for i := range status {
-			if status[i][0][:1] == " " {
-				status[i][0] = status[i][0][1:]
-			} else {
-				status[i][0] = "\b" + status[i][0]
-			}
-		}
-		info.DriverStatus = status
-	} else {
-		info.SystemStatus = status
+		SystemStatus:      c.statusHandler.Status(),
 	}
 
 	kernelVersion := "<unknown>"
@@ -205,6 +192,12 @@ func getImagesJSON(c *context, w http.ResponseWriter, r *http.Request) {
 			Filters: filters,
 		},
 	}
+	if opts.Filters.Include("dangling") &&
+		!(opts.Filters.ExactMatch("dangling", "false") || opts.Filters.ExactMatch("dangling", "true")) {
+		httpError(w, "Invalid filter: 'type'='dangling'", http.StatusBadRequest)
+		return
+	}
+
 	for _, image := range c.cluster.Images().Filter(opts) {
 		if len(accepteds) != 0 {
 			found := false
@@ -349,6 +342,12 @@ func getVolumes(c *context, w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		if filters.Include("label") {
+			if !filters.MatchKVList("label", volume.Labels) {
+				continue
+			}
+		}
+
 		tmp := (*volume).Volume
 		if tmp.Driver == "local" {
 			// Check if the volume matches any node filters
@@ -469,6 +468,18 @@ func getContainersJSON(c *context, w http.ResponseWriter, r *http.Request) {
 		if !filters.Match("node", container.Engine.Name) {
 			continue
 		}
+		if !filters.ExactMatch("health", cluster.HealthString(container.Info.State)) {
+			continue
+		}
+		if filters.Include("is-task") {
+			_, isTask := container.Config.Labels["com.docker.swarm.task"]
+			if filters.ExactMatch("is-task", "true") && !isTask {
+				continue
+			}
+			if filters.ExactMatch("is-task", "false") && isTask {
+				continue
+			}
+		}
 		if filters.Include("volume") {
 			volumeExist := fmt.Errorf("volume mounted in container")
 			err := filters.WalkValues("volume", func(value string) error {
@@ -480,6 +491,26 @@ func getContainersJSON(c *context, w http.ResponseWriter, r *http.Request) {
 				return nil
 			})
 			if err != volumeExist {
+				continue
+			}
+		}
+		if filters.Include("network") {
+			networkExist := fmt.Errorf("network attached to container")
+			err := filters.WalkValues("network", func(value string) error {
+				if _, ok := container.NetworkSettings.Networks[value]; ok {
+					return networkExist
+				}
+				for _, nw := range container.NetworkSettings.Networks {
+					if nw == nil {
+						continue
+					}
+					if strings.HasPrefix(nw.NetworkID, value) {
+						return networkExist
+					}
+				}
+				return nil
+			})
+			if err != networkExist {
 				continue
 			}
 		}
@@ -555,10 +586,6 @@ func getContainersJSON(c *context, w http.ResponseWriter, r *http.Request) {
 // GET /containers/{name:.*}/json
 func getContainerJSON(c *context, w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
-	sizeQuery := ""
-	if boolValue(r, "size") {
-		sizeQuery = "?size=1"
-	}
 	container := c.cluster.Container(name)
 	if container == nil {
 		httpError(w, fmt.Sprintf("No such container %s", name), http.StatusNotFound)
@@ -570,51 +597,28 @@ func getContainerJSON(c *context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client, scheme, err := container.Engine.HTTPClientAndScheme()
-	if err != nil {
-		httpError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	resp, err := client.Get(scheme + "://" + container.Engine.Addr + "/containers/" + container.ID + "/json" + sizeQuery)
-	container.Engine.CheckConnectionErr(err)
-	if err != nil {
-		httpError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// cleanup
-	defer resp.Body.Close()
-
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		httpError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	n, err := json.Marshal(container.Engine)
+	con, err := container.Engine.InspectContainer(container.ID)
 	if err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// insert Node field
-	data = bytes.Replace(data, []byte(`"Name":"/`), []byte(fmt.Sprintf(`"Node":%s,"Name":"/`, n)), -1)
+	con.Node = container.Engine.EngineToContainerNode()
 
-	// insert node IP
-	if engineIP := net.ParseIP(container.Engine.IP); engineIP != nil {
-		var orig string
-		if engineIP.To4() != nil {
-			orig = fmt.Sprintf(`"HostIp":"%s"`, net.IPv4zero.String())
-		} else {
-			orig = fmt.Sprintf(`"HostIp":"%s"`, net.IPv6zero.String())
+	// update zero ip to engine ip, including IPv4 and IPv6
+	if con.NetworkSettings != nil {
+		for _, portBindings := range con.NetworkSettings.Ports {
+			for key, portBinding := range portBindings {
+				if ip := net.ParseIP(portBinding.HostIP); ip == nil || ip.IsUnspecified() {
+					portBindings[key].HostIP = container.Engine.IP
+				}
+			}
 		}
-		replace := fmt.Sprintf(`"HostIp":"%s"`, container.Engine.IP)
-		data = bytes.Replace(data, []byte(orig), []byte(replace), -1)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(data)
+	json.NewEncoder(w).Encode(con)
 }
 
 // POST /containers/create
@@ -768,23 +772,42 @@ func postImagesCreate(c *context, w http.ResponseWriter, r *http.Request) {
 
 		var errorMessage string
 		errorFound := false
-		callback := func(what, status string, err error) {
-			if err != nil {
-				errorFound = true
-				errorMessage = err.Error()
-				sendJSONMessage(wf, what, fmt.Sprintf("Pulling %s... : %s", image, err.Error()))
-				return
-			}
-			if status == "" {
-				sendJSONMessage(wf, what, fmt.Sprintf("Pulling %s...", image))
+		nonOSErrorFound := false
+		successfulPull := false
+		callback := func(msg cluster.JSONMessageWrapper) {
+			msg.Msg.ID = msg.EngineName
+			if msg.Msg.Status != "" {
+				msg.Msg.Status = fmt.Sprintf("Pulling %s... : %s", image, msg.Msg.Status)
 			} else {
-				sendJSONMessage(wf, what, fmt.Sprintf("Pulling %s... : %s", image, status))
+				msg.Msg.Status = fmt.Sprintf("Pulling %s...", image)
 			}
+			// If we get a successful pull on any node, mark
+			// successfulPull as true.
+			if msg.Success {
+				successfulPull = true
+			}
+			if msg.Err != nil {
+				errorFound = true
+				errorMessage = msg.Err.Error()
+				if !strings.Contains(errorMessage, "image operating system") {
+					nonOSErrorFound = true
+				}
+				msg.Msg.Status = fmt.Sprintf("Pulling %s... : %s", image, errorMessage)
+			}
+			json.NewEncoder(wf).Encode(msg.Msg)
 		}
 		c.cluster.Pull(image, &authConfig, callback)
 
 		if errorFound {
-			sendErrorJSONMessage(wf, 1, errorMessage)
+			// If some nodes successfully pulled the image and the
+			// rest failed because the image was the wrong OS
+			// (e.g. we tried to pull a Linux-based image on a
+			// Windows node), we should still consider the pull
+			// successful because we loaded the image on as many
+			// nodes as we could.
+			if !successfulPull || nonOSErrorFound {
+				sendErrorJSONMessage(wf, 1, errorMessage)
+			}
 		}
 
 	} else { //import
@@ -794,14 +817,15 @@ func postImagesCreate(c *context, w http.ResponseWriter, r *http.Request) {
 
 		var errorMessage string
 		errorFound := false
-		callback := func(what, status string, err error) {
-			if err != nil {
+		callback := func(msg cluster.JSONMessageWrapper) {
+			msg.Msg.ID = msg.EngineName
+			if msg.Err != nil {
 				errorFound = true
-				errorMessage = err.Error()
-				sendJSONMessage(wf, what, err.Error())
-				return
+				errorMessage = msg.Err.Error()
+				msg.Msg.Status = errorMessage
 			}
-			sendJSONMessage(wf, what, status)
+			json.NewEncoder(wf).Encode(msg.Msg)
+
 		}
 		ref := getImageRef(repo, tag)
 		c.cluster.Import(source, ref, tag, r.Body, callback)
@@ -821,25 +845,25 @@ func postImagesLoad(c *context, w http.ResponseWriter, r *http.Request) {
 	wf := NewWriteFlusher(w)
 	var errorMessage string
 	errorFound := false
-	callback := func(what, status string, err error) {
-		if err != nil {
-			errorFound = true
-			errorMessage = err.Error()
-			sendJSONMessage(wf, what, fmt.Sprintf("Loading Image... : %s", err.Error()))
-			return
+	callback := func(msg cluster.JSONMessageWrapper) {
+		msg.Msg.ID = msg.EngineName
+		if msg.Msg.Status != "" {
+			msg.Msg.Status = fmt.Sprintf("Loading Image... : %s", msg.Msg.Status)
+		} else {
+			msg.Msg.Status = "Loading Image..."
 		}
 
-		if status == "" {
-			sendJSONMessage(wf, what, "Loading Image...")
-		} else {
-			sendJSONMessage(wf, what, fmt.Sprintf("Loading Image... : %s", status))
+		if msg.Err != nil {
+			errorFound = true
+			errorMessage = msg.Err.Error()
+			msg.Msg.Status = fmt.Sprintf("Loading Image... : %s", errorMessage)
 		}
+		json.NewEncoder(wf).Encode(msg.Msg)
 	}
 	c.cluster.Load(r.Body, callback)
 	if errorFound {
 		sendErrorJSONMessage(wf, 1, errorMessage)
 	}
-
 }
 
 // GET /events
@@ -864,8 +888,52 @@ func getEvents(c *context, w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 
-	c.eventsHandler.Add(r.RemoteAddr, w)
-	c.eventsHandler.Wait(r.RemoteAddr, until)
+	eventsChan, cancelFunc := c.eventsHandler.Watch()
+	defer cancelFunc()
+
+	// create timer for --until
+	var (
+		timer   *time.Timer
+		timerCh <-chan time.Time
+	)
+	if until > 0 {
+		dur := time.Unix(until, 0).Sub(time.Now())
+		timer = time.NewTimer(dur)
+		timerCh = timer.C
+	}
+	var closeNotify <-chan bool
+	if closeNotifier, ok := w.(http.CloseNotifier); ok {
+		closeNotify = closeNotifier.CloseNotify()
+	}
+
+	for {
+		select {
+		case eChan, ok := <-eventsChan:
+			if !ok {
+				return
+			}
+			e, ok := eChan.(*cluster.Event)
+			if !ok {
+				break
+			}
+			data, err := normalizeEvent(e)
+			if err != nil {
+				return
+			}
+			_, err = w.Write(data)
+			if err != nil {
+				log.Debugf("failed to write event to output stream %s", err.Error())
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		case <-closeNotify:
+			return
+		case <-timerCh:
+			return
+		}
+	}
 }
 
 // POST /containers/{name:.*}/start
@@ -877,27 +945,14 @@ func postContainersStart(c *context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hostConfig := &dockerclient.HostConfig{
-		MemorySwappiness: -1,
-	}
-
-	buf, err := ioutil.ReadAll(r.Body)
+	_, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		httpError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	r.Body.Close()
 
-	if len(buf) <= 2 || (len(buf) == 4 && string(buf) == "null") {
-		hostConfig = nil
-	} else {
-		if err := json.Unmarshal(buf, hostConfig); err != nil {
-			httpError(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-	}
-
-	if err := c.cluster.StartContainer(container, hostConfig); err != nil {
+	if err := c.cluster.StartContainer(container); err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -921,52 +976,29 @@ func postContainersExec(c *context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client, scheme, err := container.Engine.HTTPClientAndScheme()
+	execConfig := apitypes.ExecConfig{}
+	if err := json.NewDecoder(r.Body).Decode(&execConfig); err != nil {
+		httpError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if len(execConfig.Cmd) == 0 {
+		httpError(w, fmt.Sprintf("No exec command specified"), http.StatusBadRequest)
+		return
+	}
+
+	execCreateResp, err := container.Engine.CreateContainerExec(container.ID, execConfig)
 	if err != nil {
-		httpError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	resp, err := client.Post(scheme+"://"+container.Engine.Addr+"/containers/"+container.ID+"/exec", "application/json", r.Body)
-	container.Engine.CheckConnectionErr(err)
-	if err != nil {
-		httpError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// cleanup
-	defer resp.Body.Close()
-
-	// check status code
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			httpError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		httpError(w, string(body), http.StatusInternalServerError)
-		return
-	}
-
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		httpError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	id := struct{ ID string }{}
-
-	if err := json.Unmarshal(data, &id); err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// add execID to the container, so the later exec/start will work
-	container.Info.ExecIDs = append(container.Info.ExecIDs, id.ID)
+	container.Info.ExecIDs = append(container.Info.ExecIDs, execCreateResp.ID)
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	w.Write(data)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(execCreateResp)
 }
 
 // DELETE /images/{name:.*}
@@ -1135,6 +1167,8 @@ func proxyNetworkConnect(c *context, w http.ResponseWriter, r *http.Request) {
 	cb := func(resp *http.Response) {
 		// force fresh networks on this engine
 		container.Engine.RefreshNetworks()
+		// force refresh this container so that it is up to date in the cache
+		container.Engine.UpdateNetworkContainers(container.ID, true)
 	}
 
 	// request is forwarded to the container's address
@@ -1355,6 +1389,7 @@ func postBuild(c *context, w http.ResponseWriter, r *http.Request) {
 		Isolation:      containertypes.Isolation(r.Form.Get("isolation")),
 		Memory:         int64ValueOrZero(r, "memory"),
 		MemorySwap:     int64ValueOrZero(r, "memswap"),
+		NetworkMode:    r.Form.Get("networkmode"),
 		CPUShares:      int64ValueOrZero(r, "cpushares"),
 		CPUPeriod:      int64ValueOrZero(r, "cpuperiod"),
 		CPUQuota:       int64ValueOrZero(r, "cpuquota"),
@@ -1362,6 +1397,7 @@ func postBuild(c *context, w http.ResponseWriter, r *http.Request) {
 		CPUSetMems:     r.Form.Get("cpusetmems"),
 		CgroupParent:   r.Form.Get("cgroupparent"),
 		ShmSize:        int64ValueOrZero(r, "shmsize"),
+		Squash:         boolValue(r, "squash"),
 	}
 
 	buildArgsJSON := r.Form.Get("buildargs")
@@ -1379,6 +1415,11 @@ func postBuild(c *context, w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal([]byte(labelsJSON), &buildImage.Labels)
 	}
 
+	cacheFromJSON := r.Form.Get("cachefrom")
+	if cacheFromJSON != "" {
+		json.Unmarshal([]byte(cacheFromJSON), &buildImage.CacheFrom)
+	}
+
 	authEncoded := r.Header.Get("X-Registry-Config")
 	if authEncoded != "" {
 		buf, err := base64.URLEncoding.DecodeString(r.Header.Get("X-Registry-Config"))
@@ -1390,9 +1431,27 @@ func postBuild(c *context, w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	wf := NewWriteFlusher(w)
 
-	err := c.cluster.BuildImage(r.Body, buildImage, wf)
+	var errorMessage string
+	errorFound := false
+	callback := func(msg cluster.JSONMessageWrapper) {
+		msg.Msg.ID = msg.EngineName
+		if msg.Err != nil {
+			errorFound = true
+			errorMessage = msg.Err.Error()
+			osType := MatchImageOSError(errorMessage)
+			if osType != "" {
+				msg.Msg.Status = fmt.Sprintf("Could not build image: %s. Consider using --build-arg 'constraint:ostype==%s'", errorMessage, osType)
+			}
+		}
+		json.NewEncoder(wf).Encode(msg.Msg)
+	}
+	err := c.cluster.BuildImage(r.Body, buildImage, callback)
 	if err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if errorFound {
+		sendErrorJSONMessage(wf, 1, errorMessage)
 	}
 }
 
@@ -1455,4 +1514,26 @@ func notImplementedHandler(c *context, w http.ResponseWriter, r *http.Request) {
 
 func optionsHandler(c *context, w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
+}
+
+// headerFlusher is a convenient wrapper around http.ResponseWriter which
+// always flushes response headers to the client immediately.
+type headerFlusher struct {
+	http.ResponseWriter
+}
+
+func (h headerFlusher) WriteHeader(status int) {
+	h.ResponseWriter.WriteHeader(status)
+
+	// Try to flush the header immediately.
+	if flusher, ok := h.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// POST /containers/{name:.*}/wait
+// This endpoint is special because it is important to flush the response
+// header immediately.
+func postContainersWait(c *context, w http.ResponseWriter, r *http.Request) {
+	proxyContainerAndForceRefresh(c, headerFlusher{w}, r)
 }
